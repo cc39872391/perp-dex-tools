@@ -1,4 +1,4 @@
-##### 关注我 **X (Twitter)**: [@yourQuantGuy](https://x.com/yourQuantGuy)
+
 
 ---
 
