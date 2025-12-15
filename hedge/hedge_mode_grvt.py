@@ -460,7 +460,7 @@ class HedgeBot:
                                         self.lighter_best_bid = best_bid[0]
                                     if best_ask is not None:
                                         self.lighter_best_ask = best_ask[0]
-                                    
+
                                     # ========== 记录订单簿更新时间（用于延迟检测）==========
                                     self._last_order_book_update = time.time()
 
@@ -718,32 +718,30 @@ class HedgeBot:
         # Determine order parameters
         # ========== 动态偏移：根据价差和延迟调整 ==========
         order_book_age = time.time() - getattr(self, '_last_order_book_update', 0)
-        
-        # 计算价差
+
         try:
             best_bid_grvt, best_ask_grvt = await self.fetch_grvt_bbo_prices()
             mid_grvt = (best_bid_grvt + best_ask_grvt) / Decimal('2')
             mid_lt = (best_bid[0] + best_ask[0]) / Decimal('2')
             spread = abs(mid_grvt - mid_lt) / mid_lt
-            
-            # 价差大时用更小偏移（省钱），价差小时用更大偏移（保证成交）
-            if spread > Decimal('0.002'):  # 价差 > 0.2%
-                if order_book_age > 5:
-                    buy_k, sell_k = Decimal('1.002'), Decimal('0.998')  # 延迟时保守
+
+            # 更省滑点（高价差、小偏移），更快成交（低价差、大偏移）
+            if spread > Decimal('0.002'):  # 价差 > 0.2%：省成本
+                if order_book_age > 4:
+                    buy_k, sell_k = Decimal('1.0015'), Decimal('0.9985')
                 else:
-                    buy_k, sell_k = Decimal('1.001'), Decimal('0.999')   # 正常时更省
-            elif spread < Decimal('0.001'):  # 价差 < 0.1%
-                buy_k, sell_k = Decimal('1.003'), Decimal('0.997')  # 价差小时用大偏移
-            else:
-                if order_book_age > 5:
-                    buy_k, sell_k = Decimal('1.003'), Decimal('0.997')
+                    buy_k, sell_k = Decimal('1.0008'), Decimal('0.9992')
+            elif spread < Decimal('0.001'):  # 价差 < 0.1%：偏移更大，保证成交
+                buy_k, sell_k = Decimal('1.003'), Decimal('0.997')
+            else:  # 中等价差
+                if order_book_age > 4:
+                    buy_k, sell_k = Decimal('1.002'), Decimal('0.998')
                 else:
                     buy_k, sell_k = Decimal('1.0015'), Decimal('0.9985')
         except Exception as e:
-            # 默认值（如果价差计算失败）
             self.logger.warning(f"⚠️ 价差计算失败: {e}，使用默认偏移")
-            if order_book_age > 5:
-                buy_k, sell_k = Decimal('1.003'), Decimal('0.997')
+            if order_book_age > 4:
+                buy_k, sell_k = Decimal('1.002'), Decimal('0.998')
             else:
                 buy_k, sell_k = Decimal('1.0015'), Decimal('0.9985')
         
@@ -995,27 +993,25 @@ class HedgeBot:
             self.order_execution_complete = False
             self.waiting_for_lighter_fill = False
             
-            # ========== 价差检测：只在有利可图时交易 ==========
+            # ========== 价差检测：有利才做，太小就跳过 ==========
             try:
-                # 获取两边价格
                 best_bid_grvt, best_ask_grvt = await self.fetch_grvt_bbo_prices()
                 best_bid_lt, best_ask_lt = self.get_lighter_best_levels()
-                
+
                 if best_bid_lt and best_ask_lt:
-                    # 计算价差（GRVT 中价 vs Lighter 中价）
                     mid_grvt = (best_bid_grvt + best_ask_grvt) / Decimal('2')
                     mid_lt = (best_bid_lt[0] + best_ask_lt[0]) / Decimal('2')
                     spread = abs(mid_grvt - mid_lt) / mid_lt
-                    
-                    # 价差 < 0.1% 时跳过（避免亏手续费）
-                    if spread < Decimal('0.001'):
+
+                    # 价差 < 0.08% 跳过，避免纯手续费磨损
+                    if spread < Decimal('0.0008'):
                         self.logger.info(f"⏸ 价差太小（{spread*100:.3f}%），跳过本次交易")
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1)
                         continue
-                    
-                    # 价差 > 0.2% 时优先交易（有利可图）
-                    if spread > Decimal('0.002'):
-                        self.logger.info(f"✅ 价差有利（{spread*100:.3f}%），优先交易")
+
+                    # 价差 > 0.15% 视为有利，优先交易
+                    if spread > Decimal('0.0015'):
+                        self.logger.info(f"✅ 价差有利（{spread*100:.3f}%），加快节奏")
             except Exception as e:
                 self.logger.warning(f"⚠️ 价差检测失败: {e}，继续交易")
             
@@ -1047,9 +1043,8 @@ class HedgeBot:
             if self.stop_flag:
                 break
 
-            # Sleep after step 1（动态调整等待时间）
+            # Sleep after step 1（动态调整等待时间，优先提量）
             if self.sleep_time > 0:
-                # 根据价差动态调整等待时间
                 try:
                     best_bid_grvt, best_ask_grvt = await self.fetch_grvt_bbo_prices()
                     best_bid_lt, best_ask_lt = self.get_lighter_best_levels()
@@ -1057,15 +1052,15 @@ class HedgeBot:
                         mid_grvt = (best_bid_grvt + best_ask_grvt) / Decimal('2')
                         mid_lt = (best_bid_lt[0] + best_ask_lt[0]) / Decimal('2')
                         spread = abs(mid_grvt - mid_lt) / mid_lt
-                        
-                        # 价差大时缩短等待（加快交易），价差小时延长等待
+
+                        # 价差大：加快（少等2秒），中等：少等1秒，小：多等2秒
                         if spread > Decimal('0.002'):
-                            actual_sleep = max(0, self.sleep_time - 1)  # 减少1秒
+                            actual_sleep = max(0, self.sleep_time - 2)
                         elif spread < Decimal('0.001'):
-                            actual_sleep = self.sleep_time + 2  # 增加2秒
+                            actual_sleep = self.sleep_time + 2
                         else:
-                            actual_sleep = self.sleep_time
-                        
+                            actual_sleep = max(0, self.sleep_time - 1)
+
                         self.logger.info(f"💤 价差 {spread*100:.3f}%，等待 {actual_sleep} 秒")
                         await asyncio.sleep(actual_sleep)
                     else:
